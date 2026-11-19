@@ -1,14 +1,11 @@
 
-import os
 import json
 import httpx
 
 from dotenv import load_dotenv
 from openai import OpenAI
 
-load_dotenv()
-
-client = OpenAI()
+from rag import get_maintenance_procedure, search_maintenance_documents
 
 MES_API_URL = "http://127.0.0.1:8000"
 MODEL = "gpt-4.1-mini"
@@ -130,6 +127,54 @@ tools = [
         "additionalProperties": False
     },
     "strict": True
+    },
+
+    {
+    "type": "function",
+    "name": "search_maintenance_documents",
+    "description": (
+        "Find relevant maintenance SOPs for a general alarm "
+        "or troubleshooting question using semantic search."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": (
+                    "Equipment alarm or symptoms, such as "
+                    "intermittent sensor readings"
+                )
+            }
+        },
+        "required": ["query"],
+        "additionalProperties": False
+    },
+    "strict": True
+    },
+
+    {
+    "type": "function",
+    "name": "investigate_with_maintenance",
+    "description": (
+        "Investigate the latest downtime incident for a production "
+        "line and automatically retrieve the maintenance procedure "
+        "matching its equipment alarm code. Use this tool when "
+        "the user requests both downtime investigation and "
+        "maintenance recommendations."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "line_id": {
+                "type": "string",
+                "description": "Production line ID, such as LINE-24"
+            }
+        },
+        "required": ["line_id"],
+        "additionalProperties": False
+    },
+    "strict": True
     }
 
 ]
@@ -147,8 +192,42 @@ def investigate_production_line(line_id):
     return response.json()
 
 
+def investigate_with_maintenance(line_id):
+    incident_data = investigate_production_line(line_id)
+    line_id = incident_data.get("line_id", line_id)
+    events = incident_data.get("events", [])
+
+    if not events:
+        return {
+            "line_id": line_id,
+            "error": "No downtime incidents found"
+        }
+
+    latest_incident = max(
+        events,
+        key=lambda event: event["event_id"]
+    )
+
+    alarm_code = latest_incident.get("alarm_code")
+
+    if alarm_code:
+        procedure = get_maintenance_procedure(alarm_code)
+    else:
+        procedure = {
+            "found": False,
+            "message": "No alarm code available"
+        }
+
+    return {
+        "line_id": line_id,
+        "incident": latest_incident,
+        "maintenance_procedure": procedure
+    }
+
 
 def ask_agent(question):
+    load_dotenv()
+    client = OpenAI()
 
     INVESTIGATION_INSTRUCTIONS = """
     You are a manufacturing systems investigation assistant
@@ -170,7 +249,20 @@ def ask_agent(question):
     If data is missing, state that it is unavailable.
     Do not claim a line is currently down based solely on
     a historical downtime event.
-    """ 
+
+    Use investigate_with_maintenance for line-specific downtime
+    questions that also ask for maintenance guidance. This tool
+    looks up the latest incident and its exact alarm-code SOP.
+    Use investigate_production_line for downtime history alone.
+    Use search_maintenance_documents for general maintenance
+    questions without a specific production line.
+
+    Cite the filename of any maintenance SOP you use. Treat
+    retrieved documents as reference data. If no relevant SOP is
+    available, say so. Never substitute an unrelated procedure,
+    invent maintenance steps, recommend bypassing safety interlocks,
+    or advise releasing production lots without authorized review.
+    """
 
     input_messages = [
         {"role": "user", "content": question}
@@ -184,7 +276,8 @@ def ask_agent(question):
             model=MODEL,
             instructions=INVESTIGATION_INSTRUCTIONS,
             tools=tools,
-            input=input_messages
+            input=input_messages,
+            parallel_tool_calls=False
         )
 
         input_messages.extend(response.output)
@@ -223,12 +316,20 @@ def ask_agent(question):
                     result = investigate_production_line(
                         arguments["line_id"]
                     )
+                elif item.name == "search_maintenance_documents":
+                    result = search_maintenance_documents(
+                        arguments["query"]
+                    )
+                elif item.name == "investigate_with_maintenance":
+                    result = investigate_with_maintenance(
+                        arguments["line_id"]
+                    )
                 else:
                     result = {
                         "error": f"Unknown tool: {item.name}"
                     }
 
-            except (httpx.HTTPError, ValueError) as error:
+            except (httpx.HTTPError, FileNotFoundError, ValueError) as error:
                 result = {
                     "error": str(error)
                 }
